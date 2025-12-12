@@ -129,7 +129,17 @@ func sortReports(t *testing.T, reports []types.MicroReport) []types.MicroReport 
 		if reports[i].BlockNumber != reports[j].BlockNumber {
 			return reports[i].BlockNumber < reports[j].BlockNumber
 		}
-		return reports[i].Reporter < reports[j].Reporter
+		if reports[i].Reporter != reports[j].Reporter {
+			return reports[i].Reporter < reports[j].Reporter
+		}
+		// Compare QueryId as hex string for stable ordering
+		queryIdI := fmt.Sprintf("%x", reports[i].QueryId)
+		queryIdJ := fmt.Sprintf("%x", reports[j].QueryId)
+		if queryIdI != queryIdJ {
+			return queryIdI < queryIdJ
+		}
+		// Compare MetaId as final tiebreaker
+		return reports[i].MetaId < reports[j].MetaId
 	})
 
 	return reports
@@ -157,16 +167,64 @@ func prepareBatchToSend(idxToSend []int, fixtures []ctypes.EventDataNewBlock) []
 
 	batch := make([]ctypes.EventDataNewBlock, 0, len(fixtures))
 	for idx, fx := range fixtures {
-		event := ctypes.EventDataNewBlock{
-			Block:   fx.Block,
-			BlockID: fx.BlockID,
-		}
 		if _, ok := emit[idx]; ok {
-			event = fx
+			batch = append(batch, fx)
+		} else {
+			// Create empty placeholder to maintain index alignment
+			// Empty block means the node doesn't have this block data
+			batch = append(batch, ctypes.EventDataNewBlock{})
 		}
-		batch = append(batch, event)
 	}
 	return batch
+}
+
+// normalizeFixtureHeights transforms fixtures to use sequential heights starting from 1
+// This avoids consensus issues when using high production block heights
+func normalizeFixtureHeights(fixtures []ctypes.EventDataNewBlock) []ctypes.EventDataNewBlock {
+	normalized := make([]ctypes.EventDataNewBlock, len(fixtures))
+	for i, fx := range fixtures {
+		normalized[i] = fx
+		newHeight := int64(i + 1)
+
+		if fx.Block != nil {
+			// Modify height directly - fixtures are test data, we can mutate them
+			fx.Block.Header.Height = newHeight
+			normalized[i].Block = fx.Block
+		}
+
+		// Update block number in TxResults events if present
+		if len(fx.ResultFinalizeBlock.TxResults) > 0 {
+			normalized[i].ResultFinalizeBlock.TxResults = make([]*abci.ExecTxResult, len(fx.ResultFinalizeBlock.TxResults))
+			for j, txResult := range fx.ResultFinalizeBlock.TxResults {
+				if txResult != nil {
+					txCopy := *txResult
+					// Update block_number in events
+					txCopy.Events = updateBlockNumberInEvents(txCopy.Events, newHeight)
+					normalized[i].ResultFinalizeBlock.TxResults[j] = &txCopy
+				}
+			}
+		}
+
+		// Update block height events
+		normalized[i].ResultFinalizeBlock.Events = updateBlockNumberInEvents(fx.ResultFinalizeBlock.Events, newHeight)
+	}
+	return normalized
+}
+
+func updateBlockNumberInEvents(events []abci.Event, newHeight int64) []abci.Event {
+	result := make([]abci.Event, len(events))
+	for i, ev := range events {
+		result[i] = ev
+		attrs := make([]abci.EventAttribute, len(ev.Attributes))
+		for j, attr := range ev.Attributes {
+			attrs[j] = attr
+			if attr.Key == "block_number" {
+				attrs[j].Value = fmt.Sprintf("%d", newHeight)
+			}
+		}
+		result[i].Attributes = attrs
+	}
+	return result
 }
 
 type testApp struct {
@@ -228,6 +286,9 @@ func (app *testApp) FinalizeBlock(ctx context.Context, req *abci.RequestFinalize
 		return &abci.ResponseFinalizeBlock{}, nil
 	}
 	resp := payload.ResultFinalizeBlock
+	// Clear ConsensusParamUpdates to avoid vote extensions validation errors
+	// when running tests with high block heights from production fixtures
+	resp.ConsensusParamUpdates = nil
 	return &resp, nil
 }
 

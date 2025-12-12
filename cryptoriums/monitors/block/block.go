@@ -87,10 +87,13 @@ func (m *Monitor) Run(ctx context.Context) error {
 	defer ticker.Stop()
 
 	for {
-		if err := m.catchUp(ctx, nextHeight); err != nil {
+		lastProcessed, err := m.catchUp(ctx, nextHeight)
+		if err != nil {
 			m.logger.Error("catch up failed", "error", err)
 		}
-		nextHeight++
+		if lastProcessed >= nextHeight {
+			nextHeight = lastProcessed + 1
+		}
 
 		select {
 		case <-ctx.Done():
@@ -100,25 +103,28 @@ func (m *Monitor) Run(ctx context.Context) error {
 	}
 }
 
-func (m *Monitor) catchUp(ctx context.Context, nextHeight int64) error {
+func (m *Monitor) catchUp(ctx context.Context, nextHeight int64) (lastProcessed int64, err error) {
 	latest, err := m.latestChainHeight(ctx)
 	if err != nil {
-		return err
+		return nextHeight - 1, err
 	}
 
 	m.logger.Debug("chain height", "num", latest)
 	if latest < nextHeight {
-		return nil
+		return nextHeight - 1, nil
 	}
 
 	for h := nextHeight; h <= latest; h++ {
 		event, err := m.fetchBlock(ctx, h)
 		if err != nil {
-			return fmt.Errorf("fetch block %d: %w", h, err)
+			return h - 1, fmt.Errorf("fetch block %d: %w", h, err)
 		}
-		m.processor.ProcessBlock(ctx, event)
+		if err := m.processor.ProcessBlock(ctx, event); err != nil {
+			m.logger.Error("process block failed", "height", h, "error", err)
+		}
+		lastProcessed = h
 	}
-	return nil
+	return lastProcessed, nil
 }
 
 func (m *Monitor) startHeight(ctx context.Context) (int64, error) {
@@ -164,35 +170,46 @@ func (m *Monitor) latestChainHeight(ctx context.Context) (int64, error) {
 		err    error
 	}
 	resCh := make(chan res, len(m.clients))
+	queryCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var wg sync.WaitGroup
 	for _, client := range m.clients {
 		wg.Add(1)
 		go func(cli *rpchttp.HTTP) {
 			defer wg.Done()
-			resp, err := cli.ABCIInfo(ctx)
+			resp, err := cli.ABCIInfo(queryCtx)
 			if err != nil {
-				resCh <- res{err: err}
+				select {
+				case resCh <- res{err: err}:
+				case <-queryCtx.Done():
+				}
 				return
 			}
-			resCh <- res{height: resp.Response.LastBlockHeight}
+			select {
+			case resCh <- res{height: resp.Response.LastBlockHeight}:
+			case <-queryCtx.Done():
+			}
 		}(client)
 	}
 
+	// Wait for all goroutines to finish in background
+	go func() {
+		wg.Wait()
+		close(resCh)
+	}()
+
 	var firstErr error
-	for i := 0; i < len(m.clients); i++ {
-		select {
-		case r := <-resCh:
-			if r.err == nil {
-				return r.height, nil
-			}
-			if firstErr == nil {
-				firstErr = r.err
-			}
-		case <-ctx.Done():
-			return 0, ctx.Err()
+	for r := range resCh {
+		if r.err == nil {
+			cancel() // Signal other goroutines to stop
+			return r.height, nil
+		}
+		if firstErr == nil {
+			firstErr = r.err
 		}
 	}
-	wg.Wait()
+
 	if firstErr != nil {
 		return 0, firstErr
 	}
@@ -205,19 +222,28 @@ func (m *Monitor) fetchBlock(ctx context.Context, height int64) (ctypes.EventDat
 		err   error
 	}
 	resCh := make(chan res, len(m.clients))
+	fetchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var wg sync.WaitGroup
 	for _, client := range m.clients {
 		wg.Add(1)
 		go func(cli *rpchttp.HTTP) {
 			defer wg.Done()
-			blockRes, err := cli.Block(ctx, &height)
+			blockRes, err := cli.Block(fetchCtx, &height)
 			if err != nil {
-				resCh <- res{err: err}
+				select {
+				case resCh <- res{err: err}:
+				case <-fetchCtx.Done():
+				}
 				return
 			}
-			resultsRes, err := cli.BlockResults(ctx, &height)
+			resultsRes, err := cli.BlockResults(fetchCtx, &height)
 			if err != nil {
-				resCh <- res{err: err}
+				select {
+				case resCh <- res{err: err}:
+				case <-fetchCtx.Done():
+				}
 				return
 			}
 			event := ctypes.EventDataNewBlock{
@@ -225,25 +251,30 @@ func (m *Monitor) fetchBlock(ctx context.Context, height int64) (ctypes.EventDat
 				BlockID:             blockRes.BlockID,
 				ResultFinalizeBlock: finalizeToResponse(resultsRes),
 			}
-			resCh <- res{event: event}
+			select {
+			case resCh <- res{event: event}:
+			case <-fetchCtx.Done():
+			}
 		}(client)
 	}
 
+	// Wait for all goroutines to finish in background
+	go func() {
+		wg.Wait()
+		close(resCh)
+	}()
+
 	var firstErr error
-	for i := 0; i < len(m.clients); i++ {
-		select {
-		case r := <-resCh:
-			if r.err == nil && r.event.Block != nil {
-				return r.event, nil
-			}
-			if firstErr == nil {
-				firstErr = r.err
-			}
-		case <-ctx.Done():
-			return ctypes.EventDataNewBlock{}, ctx.Err()
+	for r := range resCh {
+		if r.err == nil && r.event.Block != nil {
+			cancel() // Signal other goroutines to stop
+			return r.event, nil
+		}
+		if firstErr == nil {
+			firstErr = r.err
 		}
 	}
-	wg.Wait()
+
 	if firstErr != nil {
 		return ctypes.EventDataNewBlock{}, firstErr
 	}

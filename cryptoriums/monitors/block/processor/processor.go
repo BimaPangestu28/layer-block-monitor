@@ -2,6 +2,7 @@ package processor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -25,6 +26,9 @@ const (
 	ComponentName     = "block_processor"
 	MetricErrCount    = "errors_total"
 	MetricReportCount = "reports_total"
+
+	// DefaultDBTimeout is the timeout for database operations.
+	DefaultDBTimeout = 5 * time.Second
 )
 
 type DisputeEventHandler interface {
@@ -32,7 +36,7 @@ type DisputeEventHandler interface {
 }
 
 type BlockProcessor interface {
-	ProcessBlock(context.Context, ctypes.EventDataNewBlock)
+	ProcessBlock(context.Context, ctypes.EventDataNewBlock) error
 }
 
 type Processor struct {
@@ -93,15 +97,21 @@ func New(
 	}
 }
 
-func (p *Processor) ProcessBlock(ctx context.Context, blockEv ctypes.EventDataNewBlock) {
+func (p *Processor) ProcessBlock(ctx context.Context, blockEv ctypes.EventDataNewBlock) error {
 	if blockEv.Block == nil {
-		return
+		return nil
 	}
 	if !p.shouldProcess(blockEv.Block.Header.Height) {
-		return
+		return nil
 	}
-	p.insertTx(ctx, blockEv)
-	p.insertEvents(ctx, blockEv)
+	var errs []error
+	if err := p.insertTx(ctx, blockEv); err != nil {
+		errs = append(errs, err)
+	}
+	if err := p.insertEvents(ctx, blockEv); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 const processedHeightsLimit = 1000
@@ -124,13 +134,14 @@ func (p *Processor) shouldProcess(height int64) bool {
 	return true
 }
 
-func (p *Processor) insertTx(ctx context.Context, blockEv ctypes.EventDataNewBlock) {
+func (p *Processor) insertTx(ctx context.Context, blockEv ctypes.EventDataNewBlock) error {
 	txs := blockEv.Block.Data.Txs
 	txsResults := blockEv.ResultFinalizeBlock.TxResults
 	if len(txs) != len(txsResults) {
 		p.logger.Warn("txs length mismatch", "txs", len(txs), "results", len(txsResults))
 	}
 
+	var errs []error
 	for i := 0; i < len(txs) && i < len(txsResults); i++ {
 		raw := txs[i]
 
@@ -161,7 +172,7 @@ func (p *Processor) insertTx(ctx context.Context, blockEv ctypes.EventDataNewBlo
 			sender = findSenderFromEvents(txResp.GetEvents())
 		}
 
-		insertCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+		insertCtx, cancel := context.WithTimeout(ctx, DefaultDBTimeout)
 		_, err = p.db.Exec(insertCtx,
 			fmt.Sprintf("INSERT INTO %s (block_height, tx_hash, sender, gas_used, fee_amount) VALUES (?, ?, ?, ?, ?)", blockdb.TableNameTxs),
 			blockEv.Block.Header.Height,
@@ -173,12 +184,15 @@ func (p *Processor) insertTx(ctx context.Context, blockEv ctypes.EventDataNewBlo
 		cancel()
 		if err != nil {
 			p.logger.Error("inserting tx", "err", err)
+			errs = append(errs, fmt.Errorf("insert tx %d: %w", i, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
-func (p *Processor) insertEvents(ctx context.Context, blockEv ctypes.EventDataNewBlock) {
+func (p *Processor) insertEvents(ctx context.Context, blockEv ctypes.EventDataNewBlock) error {
 	height := blockEv.Block.Height
+	var errs []error
 
 	processEvents := func(events []abci.Event) {
 		var currentQueryID string
@@ -191,17 +205,20 @@ func (p *Processor) insertEvents(ctx context.Context, blockEv ctypes.EventDataNe
 				if err != nil {
 					p.logger.Error("failed to decode report event", "error", err)
 					p.errCount.WithLabelValues("reportDecode").Inc()
+					errs = append(errs, fmt.Errorf("decode report: %w", err))
 					continue
 				}
 				p.reportsCount.WithLabelValues(report.Reporter).Inc()
 				if err := p.storeReport(ctx, *report); err != nil {
 					p.logger.Error("failed to store report", "error", err)
 					p.errCount.WithLabelValues("reportInsert").Inc()
+					errs = append(errs, fmt.Errorf("store report: %w", err))
 				}
 			case "rewards_added":
 				if err := p.insertReward(ctx, height, ev, currentQueryID); err != nil {
 					p.logger.Error("failed to store reward", "error", err)
 					p.errCount.WithLabelValues("rewardInsert").Inc()
+					errs = append(errs, fmt.Errorf("store reward: %w", err))
 				}
 				currentQueryID = ""
 			case "new_dispute":
@@ -219,6 +236,7 @@ func (p *Processor) insertEvents(ctx context.Context, blockEv ctypes.EventDataNe
 		}
 		processEvents(txResult.Events)
 	}
+	return errors.Join(errs...)
 }
 
 func (p *Processor) insertReward(ctx context.Context, height int64, ev abci.Event, queryID string) error {
@@ -237,7 +255,7 @@ func (p *Processor) insertReward(ctx context.Context, height int64, ev abci.Even
 		return fmt.Errorf("reward missing amount")
 	}
 
-	insertCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	insertCtx, cancel := context.WithTimeout(ctx, DefaultDBTimeout)
 	defer cancel()
 
 	_, err := p.db.Exec(insertCtx,
@@ -251,7 +269,7 @@ func (p *Processor) insertReward(ctx context.Context, height int64, ev abci.Even
 }
 
 func (p *Processor) storeReport(ctx context.Context, r types.MicroReport) error {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, DefaultDBTimeout)
 	defer cancel()
 
 	var cycle uint8
