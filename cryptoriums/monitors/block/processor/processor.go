@@ -25,6 +25,9 @@ const (
 	ComponentName     = "block_processor"
 	MetricErrCount    = "errors_total"
 	MetricReportCount = "reports_total"
+
+	// DefaultDBTimeout is the timeout for database operations.
+	DefaultDBTimeout = 5 * time.Second
 )
 
 type DisputeEventHandler interface {
@@ -161,7 +164,7 @@ func (p *Processor) insertTx(ctx context.Context, blockEv ctypes.EventDataNewBlo
 			sender = findSenderFromEvents(txResp.GetEvents())
 		}
 
-		insertCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+		insertCtx, cancel := context.WithTimeout(ctx, DefaultDBTimeout)
 		_, err = p.db.Exec(insertCtx,
 			fmt.Sprintf("INSERT INTO %s (block_height, tx_hash, sender, gas_used, fee_amount) VALUES (?, ?, ?, ?, ?)", blockdb.TableNameTxs),
 			blockEv.Block.Header.Height,
@@ -237,7 +240,7 @@ func (p *Processor) insertReward(ctx context.Context, height int64, ev abci.Even
 		return fmt.Errorf("reward missing amount")
 	}
 
-	insertCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	insertCtx, cancel := context.WithTimeout(ctx, DefaultDBTimeout)
 	defer cancel()
 
 	_, err := p.db.Exec(insertCtx,
@@ -251,7 +254,7 @@ func (p *Processor) insertReward(ctx context.Context, height int64, ev abci.Even
 }
 
 func (p *Processor) storeReport(ctx context.Context, r types.MicroReport) error {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, DefaultDBTimeout)
 	defer cancel()
 
 	var cycle uint8

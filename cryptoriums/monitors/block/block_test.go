@@ -81,11 +81,12 @@ func TestDeduplication(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+			_ = cancel // cancel is called in cleanup
 
 			sqlDB, err := sql.Open("chdb", "")
 			require.NoError(t, err)
-			defer func() { _ = sqlDB.Close() }()
+			// Register DB close FIRST so it runs LAST (after monitor and nodes stop)
+			t.Cleanup(func() { _ = sqlDB.Close() })
 
 			wrappedDB, err := blockdb.New(ctx, sqlDB)
 			require.NoError(t, err)
@@ -125,7 +126,11 @@ func TestDeduplication(t *testing.T) {
 				time.Sleep(2 * time.Second)
 				runErr <- monitor.Run(ctx)
 			}()
+
+			// Register cleanup for monitor LAST so it runs FIRST (before StopTendermint)
+			// This ensures we cancel context and wait for monitor to stop before stopping nodes
 			t.Cleanup(func() {
+				cancel() // Stop the monitor first
 				select {
 				case err := <-runErr:
 					if err != nil && err != context.Canceled {

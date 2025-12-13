@@ -129,7 +129,11 @@ func sortReports(t *testing.T, reports []types.MicroReport) []types.MicroReport 
 		if reports[i].BlockNumber != reports[j].BlockNumber {
 			return reports[i].BlockNumber < reports[j].BlockNumber
 		}
-		return reports[i].Reporter < reports[j].Reporter
+		if reports[i].Reporter != reports[j].Reporter {
+			return reports[i].Reporter < reports[j].Reporter
+		}
+		// Use QueryId as tie-breaker for same reporter in same block
+		return string(reports[i].QueryId) < string(reports[j].QueryId)
 	})
 
 	return reports
@@ -227,7 +231,32 @@ func (app *testApp) FinalizeBlock(ctx context.Context, req *abci.RequestFinalize
 	if isEmptyEventDataNewBlock(payload) {
 		return &abci.ResponseFinalizeBlock{}, nil
 	}
+
 	resp := payload.ResultFinalizeBlock
+
+	// Clear ConsensusParamUpdates to avoid vote extensions validation error
+	// when using production fixtures with high block heights
+	resp.ConsensusParamUpdates = nil
+
+	// CometBFT validates that len(TxResults) == len(req.Txs)
+	// req.Txs comes from what CometBFT actually included in the block.
+	// We need to match this count while preserving fixture events.
+	txCount := len(req.Txs)
+	fixtureTxResults := resp.TxResults
+
+	// Build new TxResults matching req.Txs count
+	newTxResults := make([]*abci.ExecTxResult, txCount)
+	for i := 0; i < txCount; i++ {
+		if i < len(fixtureTxResults) && fixtureTxResults[i] != nil {
+			// Use fixture's TxResult if available
+			newTxResults[i] = fixtureTxResults[i]
+		} else {
+			// Pad with empty result for extra transactions (e.g., vote extensions)
+			newTxResults[i] = &abci.ExecTxResult{}
+		}
+	}
+	resp.TxResults = newTxResults
+
 	return &resp, nil
 }
 
@@ -252,19 +281,31 @@ func (app *testApp) Commit(context.Context, *abci.RequestCommit) (*abci.Response
 }
 
 func (app *testApp) waitForPayload(ctx context.Context, height int64) (ctypes.EventDataNewBlock, error) {
+	// Quick check without waiting - if no payload exists, return empty immediately
+	// This handles heights beyond our fixtures (e.g., 10037795 when we only have 10037791-10037794)
+	app.payloadMu.Lock()
+	payload, ok := app.payloads[height]
+	app.payloadMu.Unlock()
+	if ok {
+		return payload, nil
+	}
+
+	// Wait briefly for payload in case it's being added
+	timeout := time.After(100 * time.Millisecond)
 	for {
-		app.payloadMu.Lock()
-		payload, ok := app.payloads[height]
-		app.payloadMu.Unlock()
-
-		if ok {
-			return payload, nil
-		}
-
 		select {
 		case <-ctx.Done():
 			return ctypes.EventDataNewBlock{}, ctx.Err()
+		case <-timeout:
+			// No payload after timeout - return empty
+			return ctypes.EventDataNewBlock{}, nil
 		case <-app.notifyCh:
+			app.payloadMu.Lock()
+			payload, ok := app.payloads[height]
+			app.payloadMu.Unlock()
+			if ok {
+				return payload, nil
+			}
 		}
 	}
 }
