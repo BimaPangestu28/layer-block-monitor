@@ -87,10 +87,13 @@ func (m *Monitor) Run(ctx context.Context) error {
 	defer ticker.Stop()
 
 	for {
-		if err := m.catchUp(ctx, nextHeight); err != nil {
+		lastProcessed, err := m.catchUp(ctx, nextHeight)
+		if err != nil {
 			m.logger.Error("catch up failed", "error", err)
 		}
-		nextHeight++
+		if lastProcessed >= nextHeight {
+			nextHeight = lastProcessed + 1
+		}
 
 		select {
 		case <-ctx.Done():
@@ -100,25 +103,26 @@ func (m *Monitor) Run(ctx context.Context) error {
 	}
 }
 
-func (m *Monitor) catchUp(ctx context.Context, nextHeight int64) error {
+func (m *Monitor) catchUp(ctx context.Context, nextHeight int64) (lastProcessed int64, err error) {
 	latest, err := m.latestChainHeight(ctx)
 	if err != nil {
-		return err
+		return nextHeight - 1, err
 	}
 
 	m.logger.Debug("chain height", "num", latest)
 	if latest < nextHeight {
-		return nil
+		return nextHeight - 1, nil
 	}
 
 	for h := nextHeight; h <= latest; h++ {
 		event, err := m.fetchBlock(ctx, h)
 		if err != nil {
-			return fmt.Errorf("fetch block %d: %w", h, err)
+			return h - 1, fmt.Errorf("fetch block %d: %w", h, err)
 		}
 		m.processor.ProcessBlock(ctx, event)
+		lastProcessed = h
 	}
-	return nil
+	return lastProcessed, nil
 }
 
 func (m *Monitor) startHeight(ctx context.Context) (int64, error) {
@@ -126,6 +130,8 @@ func (m *Monitor) startHeight(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+
+	// If not backfilling, skip to current chain height (only monitor new blocks)
 	if !m.cfg.Backfill {
 		latest, err := m.latestChainHeight(ctx)
 		if err != nil {
@@ -134,8 +140,21 @@ func (m *Monitor) startHeight(ctx context.Context) (int64, error) {
 		if latest > last {
 			last = latest
 		}
+		return last + 1, nil
 	}
-	return last + 1, nil
+
+	// Backfill mode: if DB has data, continue from where we left off
+	if last > 0 {
+		return last + 1, nil
+	}
+
+	// Backfill mode with empty DB: start from earliest available block
+	// Can't start from 1 because chain's genesis height might be higher
+	earliest, err := m.earliestChainHeight(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return earliest, nil
 }
 
 func (m *Monitor) lastStoredHeight(ctx context.Context) (int64, error) {
@@ -169,12 +188,12 @@ func (m *Monitor) latestChainHeight(ctx context.Context) (int64, error) {
 		wg.Add(1)
 		go func(cli *rpchttp.HTTP) {
 			defer wg.Done()
-			resp, err := cli.ABCIInfo(ctx)
+			resp, err := cli.Status(ctx)
 			if err != nil {
 				resCh <- res{err: err}
 				return
 			}
-			resCh <- res{height: resp.Response.LastBlockHeight}
+			resCh <- res{height: resp.SyncInfo.LatestBlockHeight}
 		}(client)
 	}
 
@@ -197,6 +216,47 @@ func (m *Monitor) latestChainHeight(ctx context.Context) (int64, error) {
 		return 0, firstErr
 	}
 	return 0, errors.New("unable to query any node")
+}
+
+func (m *Monitor) earliestChainHeight(ctx context.Context) (int64, error) {
+	type res struct {
+		height int64
+		err    error
+	}
+	resCh := make(chan res, len(m.clients))
+	var wg sync.WaitGroup
+	for _, client := range m.clients {
+		wg.Add(1)
+		go func(cli *rpchttp.HTTP) {
+			defer wg.Done()
+			resp, err := cli.Status(ctx)
+			if err != nil {
+				resCh <- res{err: err}
+				return
+			}
+			resCh <- res{height: resp.SyncInfo.EarliestBlockHeight}
+		}(client)
+	}
+
+	var firstErr error
+	for i := 0; i < len(m.clients); i++ {
+		select {
+		case r := <-resCh:
+			if r.err == nil {
+				return r.height, nil
+			}
+			if firstErr == nil {
+				firstErr = r.err
+			}
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return 0, firstErr
+	}
+	return 0, errors.New("unable to query any node for earliest height")
 }
 
 func (m *Monitor) fetchBlock(ctx context.Context, height int64) (ctypes.EventDataNewBlock, error) {
@@ -230,13 +290,24 @@ func (m *Monitor) fetchBlock(ctx context.Context, height int64) (ctypes.EventDat
 	}
 
 	var firstErr error
+	var fallbackEvent ctypes.EventDataNewBlock
+	hasFallback := false
+
 	for i := 0; i < len(m.clients); i++ {
 		select {
 		case r := <-resCh:
 			if r.err == nil && r.event.Block != nil {
-				return r.event, nil
+				// Prefer results with non-empty TxResults (from nodes with full data)
+				if len(r.event.ResultFinalizeBlock.TxResults) > 0 {
+					return r.event, nil
+				}
+				// Keep first valid result as fallback
+				if !hasFallback {
+					fallbackEvent = r.event
+					hasFallback = true
+				}
 			}
-			if firstErr == nil {
+			if r.err != nil && firstErr == nil {
 				firstErr = r.err
 			}
 		case <-ctx.Done():
@@ -244,6 +315,11 @@ func (m *Monitor) fetchBlock(ctx context.Context, height int64) (ctypes.EventDat
 		}
 	}
 	wg.Wait()
+
+	// Use fallback if we have one (block with empty TxResults is better than nothing)
+	if hasFallback {
+		return fallbackEvent, nil
+	}
 	if firstErr != nil {
 		return ctypes.EventDataNewBlock{}, firstErr
 	}
