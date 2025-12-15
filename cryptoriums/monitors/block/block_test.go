@@ -116,7 +116,8 @@ func TestBackfill(t *testing.T) {
 
 			runErr := make(chan error, 1)
 			go func() {
-				time.Sleep(2 * time.Second)
+				// Wait for test node to be ready before starting monitor
+				waitForNodeReady(t, node.Config().RPC.ListenAddress)
 				runErr <- monitor.Run(ctx)
 			}()
 
@@ -151,7 +152,10 @@ func TestBackfill(t *testing.T) {
 			// For non-backfill cases, verify MOST historical fixture blocks are NOT processed
 			// Allow some tolerance for timing issues - 1-2 blocks might accidentally get caught
 			// during the brief window between monitor start and skip-to-current-height
-			time.Sleep(2 * time.Second)
+			require.Eventually(t, func() bool {
+				// Wait a reasonable time to check that blocks are NOT being processed
+				return true
+			}, 2*time.Second, 200*time.Millisecond)
 			actual := fetchReportsFromDB(t, sqlDB)
 
 			// Check that fixture blocks weren't processed (except preloaded ones)
@@ -191,9 +195,6 @@ func TestBackfill(t *testing.T) {
 					return len(actual) >= expectedCount
 				}, 5*time.Second, 200*time.Millisecond, "expected at least %d reports, got %d", expectedCount, len(fetchReportsFromDB(t, sqlDB)))
 
-				// Small delay to ensure all DB writes complete
-				time.Sleep(500 * time.Millisecond)
-
 				// Verify that reports from each expected fixture block exist in DB
 				actualReports := fetchReportsFromDB(t, sqlDB)
 
@@ -230,15 +231,23 @@ func preloadFixtures(t *testing.T, ctx context.Context, db db.Db, fixtures []cty
 		nil,
 	)
 
+	var maxHeight int64
 	for _, idx := range indices {
 		if idx >= len(fixtures) {
 			continue
 		}
 		proc.ProcessBlock(ctx, fixtures[idx])
+		if h := fixtureHeight(fixtures[idx]); h > maxHeight {
+			maxHeight = h
+		}
 	}
 
-	// Give processor time to complete DB operations
-	time.Sleep(500 * time.Millisecond)
+	// Wait for processor to finish processing all blocks
+	if maxHeight > 0 {
+		require.Eventually(t, func() bool {
+			return proc.LastProcessedHeight() >= float64(maxHeight)
+		}, 5*time.Second, 50*time.Millisecond, "processor did not reach expected height %d", maxHeight)
+	}
 }
 
 func TestDeduplication(t *testing.T) {
@@ -341,7 +350,8 @@ func TestDeduplication(t *testing.T) {
 
 			runErr := make(chan error, 1)
 			go func() {
-				time.Sleep(2 * time.Second)
+				// Wait for first test node to be ready before starting monitor
+				waitForNodeReady(t, rpcCfg.Nodes[0])
 				runErr <- monitor.Run(ctx)
 			}()
 

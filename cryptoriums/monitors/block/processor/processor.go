@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cosmossdk.io/log"
@@ -22,9 +23,10 @@ import (
 )
 
 const (
-	ComponentName     = "block_processor"
-	MetricErrCount    = "errors_total"
-	MetricReportCount = "reports_total"
+	ComponentName              = "block_processor"
+	MetricErrCount             = "errors_total"
+	MetricReportCount          = "reports_total"
+	MetricLastProcessedHeight  = "last_processed_height"
 
 	// DefaultDBTimeout is the timeout for database operations.
 	DefaultDBTimeout = 5 * time.Second
@@ -36,15 +38,18 @@ type DisputeEventHandler interface {
 
 type BlockProcessor interface {
 	ProcessBlock(context.Context, ctypes.EventDataNewBlock)
+	LastProcessedHeight() float64
 }
 
 type Processor struct {
-	logger       log.Logger
-	db           blockdb.Db
-	txDecoder    sdk.TxDecoder
-	errCount     *prometheus.CounterVec
-	reportCount  prometheus.Counter
-	reportsCount *prometheus.CounterVec
+	logger              log.Logger
+	db                  blockdb.Db
+	txDecoder           sdk.TxDecoder
+	errCount            *prometheus.CounterVec
+	reportCount         prometheus.Counter
+	reportsCount        *prometheus.CounterVec
+	lastProcessedHeight prometheus.Gauge
+	lastHeight          atomic.Int64
 
 	disputeHandler DisputeEventHandler
 
@@ -84,15 +89,23 @@ func New(
 		Help:      "Reports observed per reporter by " + ComponentName,
 	}, []string{"reporter"})
 
+	lastProcessedHeight := promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+		Namespace: cryptoriums.MetricsNamespace,
+		Subsystem: ComponentName,
+		Name:      MetricLastProcessedHeight,
+		Help:      "Last block height processed by " + ComponentName,
+	})
+
 	return &Processor{
-		logger:           logger.With("component", ComponentName),
-		db:               db,
-		txDecoder:        NewTxDecoder(),
-		errCount:         errCount,
-		reportCount:      reportCount,
-		reportsCount:     reportsCount,
-		disputeHandler:   disputeHandler,
-		processedHeights: make(map[int64]struct{}),
+		logger:              logger.With("component", ComponentName),
+		db:                  db,
+		txDecoder:           NewTxDecoder(),
+		errCount:            errCount,
+		reportCount:         reportCount,
+		reportsCount:        reportsCount,
+		lastProcessedHeight: lastProcessedHeight,
+		disputeHandler:      disputeHandler,
+		processedHeights:    make(map[int64]struct{}),
 	}
 }
 
@@ -105,6 +118,14 @@ func (p *Processor) ProcessBlock(ctx context.Context, blockEv ctypes.EventDataNe
 	}
 	p.insertTx(ctx, blockEv)
 	p.insertEvents(ctx, blockEv)
+	height := blockEv.Block.Header.Height
+	p.lastProcessedHeight.Set(float64(height))
+	p.lastHeight.Store(height)
+}
+
+// LastProcessedHeight returns the last block height that was processed.
+func (p *Processor) LastProcessedHeight() float64 {
+	return float64(p.lastHeight.Load())
 }
 
 const processedHeightsLimit = 1000

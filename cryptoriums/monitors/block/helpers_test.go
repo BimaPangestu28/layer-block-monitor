@@ -15,6 +15,7 @@ import (
 
 	"github.com/cometbft/cometbft/abci/example/kvstore"
 	abci "github.com/cometbft/cometbft/abci/types"
+	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
 	ctypes "github.com/cometbft/cometbft/types"
 	"github.com/stretchr/testify/require"
 	blockdb "github.com/tellor-io/layer/cryptoriums/db"
@@ -343,4 +344,24 @@ func cloneTxs(txs ctypes.Txs) [][]byte {
 
 func isEmptyEventDataNewBlock(ev ctypes.EventDataNewBlock) bool {
 	return ev.Block == nil && len(ev.ResultFinalizeBlock.Events) == 0 && len(ev.ResultFinalizeBlock.TxResults) == 0
+}
+
+// waitForNodeReady polls the RPC node until it reports a valid chain height.
+// This replaces hardcoded sleeps with a proper readiness check.
+func waitForNodeReady(t *testing.T, nodeAddr string) {
+	t.Helper()
+
+	client, err := rpchttp.New(nodeAddr, "/websocket")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.Eventually(t, func() bool {
+		status, err := client.Status(ctx)
+		if err != nil {
+			return false
+		}
+		return status.SyncInfo.LatestBlockHeight > 0
+	}, 10*time.Second, 100*time.Millisecond, "node at %s did not become ready", nodeAddr)
 }
